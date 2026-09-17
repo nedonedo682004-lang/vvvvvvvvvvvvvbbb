@@ -103,17 +103,24 @@ def _remove_from_unknown(bin_keys):
 # ==================== EXTERNAL INFO ====================
 
 def _get_bin_info_external(bin_num):
+    """يجيب معلومات البين من antipublic"""
     try:
         r = requests.get(f'https://bins.antipublic.cc/bins/{bin_num}', timeout=8)
         if r.status_code == 200:
             data = r.json()
+            brand = (data.get('brand') or 'UNKNOWN').upper()
+            btype = (data.get('type') or 'UNKNOWN').upper()
+            level = (data.get('level') or 'UNKNOWN').upper()
+            info_parts = [p for p in [brand, btype, level] if p and p != 'UNKNOWN']
+            info = ' '.join(info_parts) if info_parts else 'UNKNOWN'
             return {
-                'brand': data.get('brand', 'UNKNOWN'),
-                'type': data.get('type', 'UNKNOWN'),
-                'level': data.get('level', 'UNKNOWN'),
-                'bank': data.get('bank', 'UNKNOWN'),
-                'country': data.get('country_name', 'UNKNOWN'),
-                'flag': data.get('country_flag', '')
+                'brand': brand,
+                'type': btype,
+                'level': level,
+                'bank': (data.get('bank') or 'UNKNOWN').upper(),
+                'country': (data.get('country_name') or 'UNKNOWN').upper(),
+                'flag': data.get('country_flag', ''),
+                'info': info
             }
     except Exception:
         pass
@@ -123,7 +130,8 @@ def _get_bin_info_external(bin_num):
         'level': 'UNKNOWN',
         'bank': 'UNKNOWN',
         'country': 'UNKNOWN',
-        'flag': ''
+        'flag': '',
+        'info': 'UNKNOWN'
     }
 
 def _format_vbv(vbv_str):
@@ -134,6 +142,41 @@ def _format_vbv(vbv_str):
         return '❌ VBV'
     return '❓ UNKNOWN'
 
+def _extract_scheme_type_level(info):
+    """يستخرج brand/type/level من info string"""
+    if not info or info == 'UNKNOWN':
+        return 'UNKNOWN', 'UNKNOWN', 'UNKNOWN'
+    parts = info.upper().split()
+    brand = parts[0] if len(parts) > 0 else 'UNKNOWN'
+    btype = parts[1] if len(parts) > 1 else 'UNKNOWN'
+    level = parts[2] if len(parts) > 2 else 'UNKNOWN'
+    return brand, btype, level
+
+def _merge_info(db_entry, external):
+    """يدمج معلومات DB مع معلومات antipublic"""
+    # DB أولاً
+    bank = db_entry.get('bank') or ''
+    country = db_entry.get('country') or ''
+    flag = db_entry.get('flag') or ''
+    info = db_entry.get('info') or ''
+
+    # لو ناقص، جيب من external
+    if not bank or bank.upper() in ['UNKNOWN', '', 'N/A']:
+        bank = external.get('bank', 'UNKNOWN')
+    if not country or country.upper() in ['UNKNOWN', '', 'N/A']:
+        country = external.get('country', 'UNKNOWN')
+    if not flag:
+        flag = external.get('flag', '')
+    if not info or info.upper() in ['UNKNOWN', '', 'N/A']:
+        info = external.get('info', 'UNKNOWN')
+
+    return {
+        'bank': bank.upper() if bank else 'UNKNOWN',
+        'country': country.upper() if country else 'UNKNOWN',
+        'flag': flag,
+        'info': info.upper() if info else 'UNKNOWN'
+    }
+
 # ==================== PUBLIC ROUTES ====================
 
 @app.route('/', methods=['GET'])
@@ -141,7 +184,7 @@ def home():
     return jsonify({
         'status': 'online',
         'service': 'Jinx BIN API',
-        'version': '1.1',
+        'version': '1.2',
         'developer': DEVELOPER,
         'endpoints': {
             'vbv': 'GET /vbv?bin=XXXXXX',
@@ -161,25 +204,55 @@ def vbv_lookup():
             db = _load_db()
 
         if bin_key in db:
-            raw_vbv = db[bin_key].get('vbv', 'UNKNOWN')
-            vbv_status = _format_vbv(raw_vbv)
             entry = db[bin_key]
-            bank = entry.get('bank')
-            country = entry.get('country')
-            flag = entry.get('flag')
-            info = entry.get('info')
-            if bank and country:
-                return jsonify({
-                    'success': True,
-                    'developer': DEVELOPER,
-                    'bin': bin_key,
-                    'vbv': vbv_status,
-                    'bank': bank,
-                    'country': country,
-                    'flag': flag or '',
-                    'info': info or ''
-                })
+            raw_vbv = entry.get('vbv', 'UNKNOWN')
+            vbv_status = _format_vbv(raw_vbv)
 
+            # جيب معلومات antipublic (للدعم)
+            external = _get_bin_info_external(bin_key)
+
+            # ادمج: DB أولاً، وبعدين antipublic
+            merged = _merge_info(entry, external)
+
+            # حدّث الـ DB بالمعلومات المدموجة (عشان المرة الجاية تكون أسرع)
+            updated = False
+            if entry.get('bank') != merged['bank'] and merged['bank'] != 'UNKNOWN':
+                entry['bank'] = merged['bank']
+                updated = True
+            if entry.get('country') != merged['country'] and merged['country'] != 'UNKNOWN':
+                entry['country'] = merged['country']
+                updated = True
+            if not entry.get('flag') and merged['flag']:
+                entry['flag'] = merged['flag']
+                updated = True
+            if entry.get('info') != merged['info'] and merged['info'] != 'UNKNOWN':
+                entry['info'] = merged['info']
+                updated = True
+
+            if updated:
+                entry['updated_at'] = int(datetime.now().timestamp())
+                db[bin_key] = entry
+                with db_lock:
+                    _save_db(db)
+
+            # استخرج scheme/type/level من info
+            brand, btype, level = _extract_scheme_type_level(merged['info'])
+
+            return jsonify({
+                'success': True,
+                'developer': DEVELOPER,
+                'bin': bin_key,
+                'vbv': vbv_status,
+                'brand': brand,
+                'type': btype,
+                'level': level,
+                'bank': merged['bank'],
+                'country': merged['country'],
+                'flag': merged['flag'],
+                'info': merged['info']
+            })
+
+        # مش موجود في DB → antipublic بس
         external = _get_bin_info_external(bin_key)
         _record_unknown(bin_key, external)
 
@@ -193,7 +266,8 @@ def vbv_lookup():
             'level': external['level'],
             'bank': external['bank'],
             'country': external['country'],
-            'flag': external['flag']
+            'flag': external['flag'],
+            'info': external.get('info', 'UNKNOWN')
         })
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
@@ -217,15 +291,40 @@ def mbins_lookup():
             bin_key = bin_str[:6]
 
             if bin_key in db:
-                raw_vbv = db[bin_key].get('vbv', 'UNKNOWN')
                 entry = db[bin_key]
+                raw_vbv = entry.get('vbv', 'UNKNOWN')
+                external = _get_bin_info_external(bin_key)
+                merged = _merge_info(entry, external)
+                brand, btype, level = _extract_scheme_type_level(merged['info'])
+
+                # حدّث DB
+                updated = False
+                if entry.get('bank') != merged['bank'] and merged['bank'] != 'UNKNOWN':
+                    entry['bank'] = merged['bank']
+                    updated = True
+                if entry.get('country') != merged['country'] and merged['country'] != 'UNKNOWN':
+                    entry['country'] = merged['country']
+                    updated = True
+                if not entry.get('flag') and merged['flag']:
+                    entry['flag'] = merged['flag']
+                    updated = True
+                if entry.get('info') != merged['info'] and merged['info'] != 'UNKNOWN':
+                    entry['info'] = merged['info']
+                    updated = True
+                if updated:
+                    entry['updated_at'] = int(datetime.now().timestamp())
+                    db[bin_key] = entry
+
                 results.append({
                     'bin': bin_key,
                     'vbv': _format_vbv(raw_vbv),
-                    'bank': entry.get('bank', 'UNKNOWN'),
-                    'country': entry.get('country', 'UNKNOWN'),
-                    'flag': entry.get('flag', ''),
-                    'info': entry.get('info', 'UNKNOWN')
+                    'brand': brand,
+                    'type': btype,
+                    'level': level,
+                    'bank': merged['bank'],
+                    'country': merged['country'],
+                    'flag': merged['flag'],
+                    'info': merged['info']
                 })
             else:
                 external = _get_bin_info_external(bin_key)
@@ -238,8 +337,13 @@ def mbins_lookup():
                     'level': external['level'],
                     'bank': external['bank'],
                     'country': external['country'],
-                    'flag': external['flag']
+                    'flag': external['flag'],
+                    'info': external.get('info', 'UNKNOWN')
                 })
+
+        # حفظ التحديثات
+        with db_lock:
+            _save_db(db)
 
         return jsonify({
             'success': True,
@@ -274,7 +378,14 @@ def addbin():
         bins_list = data.get('bins', [])
         if not isinstance(bins_list, list):
             if data.get('bin'):
-                bins_list = [{'bin': data.get('bin'), 'vbv': data.get('vbv', 'UNKNOWN')}]
+                bins_list = [{
+                    'bin': data.get('bin'),
+                    'vbv': data.get('vbv', 'UNKNOWN'),
+                    'bank': data.get('bank', 'UNKNOWN'),
+                    'country': data.get('country', 'UNKNOWN'),
+                    'flag': data.get('flag', ''),
+                    'info': data.get('info', 'UNKNOWN')
+                }]
             else:
                 return jsonify({'success': False, 'error': 'No bins provided'}), 400
         if not bins_list:
@@ -291,17 +402,34 @@ def addbin():
             for item in bins_list:
                 bin_num = str(item.get('bin', '')).strip()
                 vbv = str(item.get('vbv', 'UNKNOWN')).strip()
+                bank = str(item.get('bank', 'UNKNOWN')).strip()
+                country = str(item.get('country', 'UNKNOWN')).strip()
+                flag = str(item.get('flag', '')).strip()
+                info = str(item.get('info', 'UNKNOWN')).strip()
+
                 if not bin_num or len(bin_num) < 6:
                     skipped += 1
                     continue
                 bin_key = bin_num[:6]
                 if bin_key in db:
                     db[bin_key]['vbv'] = vbv
+                    if bank and bank.upper() != 'UNKNOWN':
+                        db[bin_key]['bank'] = bank.upper()
+                    if country and country.upper() != 'UNKNOWN':
+                        db[bin_key]['country'] = country.upper()
+                    if flag:
+                        db[bin_key]['flag'] = flag
+                    if info and info.upper() != 'UNKNOWN':
+                        db[bin_key]['info'] = info.upper()
                     db[bin_key]['updated_at'] = now
                     updated += 1
                 else:
                     db[bin_key] = {
                         'vbv': vbv,
+                        'bank': bank.upper() if bank else 'UNKNOWN',
+                        'country': country.upper() if country else 'UNKNOWN',
+                        'flag': flag,
+                        'info': info.upper() if info else 'UNKNOWN',
                         'added_at': now,
                         'updated_at': now
                     }
@@ -497,8 +625,17 @@ def unknown_promote():
                 with unknown_lock:
                     unknown = _load_unknown()
                     for bin_key, info in unknown.items():
+                        info_parts = [info.get('brand', 'UNKNOWN'), info.get('type', 'UNKNOWN'), info.get('level', 'UNKNOWN')]
+                        info_str = ' '.join([p for p in info_parts if p and p != 'UNKNOWN']).strip() or 'UNKNOWN'
                         if bin_key in db:
                             db[bin_key]['vbv'] = default_vbv
+                            if info.get('bank') and info['bank'] != 'UNKNOWN':
+                                db[bin_key]['bank'] = info['bank']
+                            if info.get('country') and info['country'] != 'UNKNOWN':
+                                db[bin_key]['country'] = info['country']
+                            if info.get('flag'):
+                                db[bin_key]['flag'] = info['flag']
+                            db[bin_key]['info'] = info_str
                             db[bin_key]['updated_at'] = now
                             updated += 1
                         else:
@@ -507,7 +644,7 @@ def unknown_promote():
                                 'bank': info.get('bank', 'UNKNOWN'),
                                 'country': info.get('country', 'UNKNOWN'),
                                 'flag': info.get('flag', ''),
-                                'info': f"{info.get('brand', 'UNKNOWN')} {info.get('type', 'UNKNOWN')} {info.get('level', 'UNKNOWN')}".strip(),
+                                'info': info_str,
                                 'added_at': now,
                                 'updated_at': now
                             }
@@ -533,12 +670,14 @@ def unknown_promote():
                             updated += 1
                         else:
                             info = unknown.get(bin_key, {})
+                            info_parts = [info.get('brand', 'UNKNOWN'), info.get('type', 'UNKNOWN'), info.get('level', 'UNKNOWN')]
+                            info_str = ' '.join([p for p in info_parts if p and p != 'UNKNOWN']).strip() or 'UNKNOWN'
                             db[bin_key] = {
                                 'vbv': vbv,
                                 'bank': info.get('bank', 'UNKNOWN'),
                                 'country': info.get('country', 'UNKNOWN'),
                                 'flag': info.get('flag', ''),
-                                'info': f"{info.get('brand', 'UNKNOWN')} {info.get('type', 'UNKNOWN')} {info.get('level', 'UNKNOWN')}".strip(),
+                                'info': info_str,
                                 'added_at': now,
                                 'updated_at': now
                             }
